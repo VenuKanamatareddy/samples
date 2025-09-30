@@ -153,6 +153,21 @@ class StrandsToOpenInferenceProcessor(SpanProcessor):
             span._attributes.update(transformed_attrs)
             self.processed_spans.add(span_id)
             
+            # Check if llm.prompt_template.variables is in final attributes
+            if span_kind == "LLM":
+                if "llm.prompt_template.variables" in transformed_attrs:
+                    self._debug_log('INFO', 'llm.prompt_template.variables IS in final transformed_attrs for LLM span',
+                                   value=transformed_attrs.get("llm.prompt_template.variables"))
+                else:
+                    self._debug_log('WARN', 'llm.prompt_template.variables NOT in final transformed_attrs for LLM span')
+                
+                # Final check on actual span attributes
+                if hasattr(span, '_attributes') and "llm.prompt_template.variables" in span._attributes:
+                    self._debug_log('SUCCESS', 'llm.prompt_template.variables IS in span._attributes!',
+                                   value=span._attributes.get("llm.prompt_template.variables"))
+                else:
+                    self._debug_log('ERROR', 'llm.prompt_template.variables NOT in span._attributes after update')
+            
             if self.debug:
                 self._debug_log('INFO', f'Transformed span successfully',
                                span_name=span.name, original_attrs=len(original_attrs),
@@ -204,6 +219,7 @@ class StrandsToOpenInferenceProcessor(SpanProcessor):
         
         # Handle different span types
         if span_kind in ["LLM", "AGENT", "CHAIN"]:
+            self._debug_log('DEBUG', f'Calling _handle_llm_span for span_kind: {span_kind}')
             self._handle_llm_span(attrs, result, input_messages, output_messages, span)
         elif span_kind == "TOOL":
             self._handle_tool_span(attrs, result, events)
@@ -226,7 +242,23 @@ class StrandsToOpenInferenceProcessor(SpanProcessor):
         
         # Filter out arize.* attributes for LLM spans
         if span_kind == "LLM":
+            # Check before filter
+            has_before = "llm.prompt_template.variables" in result
+            if has_before:
+                self._debug_log('DEBUG', 'llm.prompt_template.variables EXISTS before filter', 
+                               value=result.get("llm.prompt_template.variables"))
+            
             result = self._filter_arize_attributes(result)
+            
+            # Check after filter
+            has_after = "llm.prompt_template.variables" in result
+            if has_after:
+                self._debug_log('INFO', 'llm.prompt_template.variables EXISTS after filter in final result', 
+                               value=result.get("llm.prompt_template.variables"))
+            elif has_before and not has_after:
+                self._debug_log('ERROR', 'llm.prompt_template.variables was REMOVED by filter!')
+            else:
+                self._debug_log('WARN', 'llm.prompt_template.variables was NEVER SET for this LLM span')
             
         return result
 
@@ -300,19 +332,9 @@ class StrandsToOpenInferenceProcessor(SpanProcessor):
         # Map invocation parameters
         self._map_invocation_parameters(attrs, result)
         
-        # Add nested LLM data as span event for Arize UI compatibility (v2.7.0)
-        # Note: Use the potentially updated input_messages that includes system prompt
-        if span_kind == "LLM" and system_prompt:
-            # Get the updated input_messages that should now include the system prompt
-            if "llm.input_messages" in result:
-                try:
-                    updated_input_messages = json.loads(result["llm.input_messages"])
-                    self._add_arize_compatible_event(span, updated_input_messages, output_messages, system_prompt, attrs)
-                except json.JSONDecodeError:
-                    # Fallback to original input_messages
-                    self._add_arize_compatible_event(span, input_messages, output_messages, system_prompt, attrs)
-            else:
-                self._add_arize_compatible_event(span, input_messages, output_messages, system_prompt, attrs)
+        # Note: Cannot add events to spans in on_end since the span is already ended
+        # The _add_arize_compatible_event calls have been removed to prevent the error:
+        # "'ReadableSpan' object has no attribute 'add_event'"
                 
         # NEW v2.8.0: Also try adding nested LLM data as JSON string attribute
         if span_kind == "LLM" and system_prompt:
@@ -545,6 +567,26 @@ class StrandsToOpenInferenceProcessor(SpanProcessor):
         if span_kind in ["LLM", "AGENT", "CHAIN"]:
             # Create input.value
             if input_messages:
+                self._debug_log('DEBUG', f'Processing {len(input_messages)} input messages for {span_kind} span')
+                # Extract user query for prompt template variables
+                user_query = None
+                for idx, msg in enumerate(input_messages):
+                    self._debug_log('DEBUG', f'Message {idx}', 
+                                   msg_keys=list(msg.keys()) if isinstance(msg, dict) else 'not-dict',
+                                   role=msg.get('message.role') if isinstance(msg, dict) else None)
+                    if isinstance(msg, dict) and msg.get('message.role') == 'user':
+                        user_query = msg.get('message.content', '')
+                        if user_query:
+                            self._debug_log('DEBUG', f'Found user query in message {idx}', query_length=len(user_query))
+                            break
+                
+                # Set llm.prompt_template.variables if we found a user query
+                if user_query and span_kind == "LLM":
+                    result["llm.prompt_template.variables"] = json.dumps({"query": user_query}, separators=(",", ":"))
+                    self._debug_log('INFO', 'Set llm.prompt_template.variables in _create_input_output_values',
+                                   span_kind=span_kind, query_length=len(user_query),
+                                   value=result["llm.prompt_template.variables"])
+                
                 if len(input_messages) == 1 and input_messages[0].get('message.role') == 'user':
                     # Simple user message
                     result["input.value"] = input_messages[0].get('message.content', '')
